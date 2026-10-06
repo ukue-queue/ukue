@@ -1,14 +1,23 @@
 name: release
 
-# Builds the ukue binaries when a version tag such as v0.1.0 is pushed, checks
-# each one, and attaches them to a GitHub release.
+# Builds the ukue binaries when a GitHub release is published, checks each
+# one, and attaches them to the release. It can also be run by hand for an
+# existing release tag.
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, such as v0.1.0"
+        required: true
 
 permissions:
   contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
   linux:
@@ -22,6 +31,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
@@ -54,6 +65,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
@@ -79,6 +92,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
@@ -133,25 +148,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Publish
+      - name: Attach the binaries to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
-          cat > notes.md <<EOF
-          Ready-built ukue binaries. Each archive holds the \`ukue\` command with its license files.
-
-          | System | File |
-          |---|---|
-          | Linux, x86-64 (static) | ukue_linux_amd64.tar.gz |
-          | Linux, ARM64 (static) | ukue_linux_arm64.tar.gz |
-          | macOS, Apple silicon | ukue_darwin_arm64.tar.gz |
-          | macOS, Intel | ukue_darwin_amd64.tar.gz |
-          | Windows, x86-64 | ukue_windows_amd64.zip |
-
-          SHA256SUMS lists the checksums. The macOS binaries aren't signed by Apple, so macOS may ask you to allow them the first time (or run \`xattr -d com.apple.quarantine ukue\`).
-          EOF
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "ukue $GITHUB_REF_NAME" --notes-file notes.md \
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             ukue_linux_amd64.tar.gz ukue_linux_arm64.tar.gz ukue_darwin_arm64.tar.gz ukue_darwin_amd64.tar.gz ukue_windows_amd64.zip SHA256SUMS
