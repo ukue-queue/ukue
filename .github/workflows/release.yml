@@ -157,3 +157,23 @@ jobs:
           cat SHA256SUMS
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             ukue_linux_amd64.tar.gz ukue_linux_arm64.tar.gz ukue_darwin_arm64.tar.gz ukue_darwin_amd64.tar.gz ukue_windows_amd64.zip SHA256SUMS
+      - name: Describe the binaries if the release has no notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          if [ -n "$body" ]; then exit 0; fi
+          cat > notes.md <<'EOF'
+          Ready-built ukue binaries. Each archive holds the `ukue` command with its license files.
+
+          | System | File |
+          |---|---|
+          | Linux, x86-64 (static) | ukue_linux_amd64.tar.gz |
+          | Linux, ARM64 (static) | ukue_linux_arm64.tar.gz |
+          | macOS, Apple silicon | ukue_darwin_arm64.tar.gz |
+          | macOS, Intel | ukue_darwin_amd64.tar.gz |
+          | Windows, x86-64 | ukue_windows_amd64.zip |
+
+          SHA256SUMS lists the checksums. The macOS binaries aren't signed by Apple, so macOS may ask you to allow them the first time, or you can run `xattr -d com.apple.quarantine ukue`.
+          EOF
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
