@@ -27,6 +27,11 @@ UKUE_TOKEN=s3cret ukue serve --addr :7660 jobs.ukue
   comes back as the string `payload`, and anything else as `payload_base64`.
 - **Size.** A request body may be up to 1 MiB unless the server was started
   with `--max-body`.
+- **Browsers.** Requests that change something are refused with `403` when
+  they come from a web page on another site, as browsers report in the
+  `Sec-Fetch-Site` and `Origin` headers. Without a token, the server also
+  answers only requests addressed to `localhost`, `127.0.0.1` or `::1`, so a
+  web page can't reach it through a DNS name that points at your machine.
 
 ## Adding jobs
 
@@ -37,7 +42,7 @@ UKUE_TOKEN=s3cret ukue serve --addr :7660 jobs.ukue
 ```
 
 Only `queue` is required. Use `delay` or `run_at` (an RFC 3339 time), not
-both. Answers `201` with `{"id": 42}`.
+both. `priority` runs from -100 to 100. Answers `201` with `{"id": 42}`.
 
 ## Running jobs
 
@@ -95,9 +100,10 @@ or `{"state": "dead"}`.
 `{"token": "..."}`. Puts the job straight back on the queue without counting
 the attempt, for a worker that is shutting down.
 
-If the worker no longer holds the job, because its lease ran out or the job
-was deleted, these four calls answer `409`. The job may already be running
-somewhere else.
+These four calls answer `409` once the worker no longer holds the job: the
+job was deleted, or its lease ran out and a later claim put it back on the
+queue. The job may then already be running somewhere else. A late call that
+arrives before anyone has put the job back still counts.
 
 ## Looking and tidying up
 

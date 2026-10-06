@@ -5,6 +5,7 @@ package ukue
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
@@ -247,4 +248,98 @@ func TestGoroutinesClaimEachJobOnce(t *testing.T) {
 		}
 	}
 	t.Logf("%d jobs claimed and acknowledged by %d goroutines in %s: %.0f jobs/s", n, workers, took.Round(time.Millisecond), float64(n)/took.Seconds())
+}
+
+// TestWorkRetriesAckWhileTheFileIsLocked holds the write lock from another
+// connection longer than the busy timeout just as a job finishes. The worker
+// must keep trying to mark it done, and the job must not run twice.
+func TestWorkRetriesAckWhileTheFileIsLocked(t *testing.T) {
+	q, path := openTemp(t, WithBusyTimeout(100*time.Millisecond), WithKeepDone(true))
+	id := must[int64](t)(q.Enqueue(bg, "q", nil))
+	other, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	lock, err := other.Conn(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	var runs atomic.Int32
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	go q.Work(ctx, "q", func(ctx context.Context, j *Job) error {
+		runs.Add(1)
+		if _, err := lock.ExecContext(bg, "BEGIN IMMEDIATE"); err != nil {
+			return err
+		}
+		time.AfterFunc(time.Second, func() { lock.ExecContext(bg, "COMMIT") })
+		return nil
+	}, Lease(3*time.Second), PollInterval(20*time.Millisecond))
+	waitFor(t, 10*time.Second, "the job to be marked done", func() bool {
+		info, err := q.Get(bg, id)
+		return err == nil && info.State == StateDone
+	})
+	time.Sleep(500 * time.Millisecond)
+	if n := runs.Load(); n != 1 {
+		t.Fatalf("the job ran %d times", n)
+	}
+}
+
+// TestWorkStopsAJobWhoseLeaseCantBeRenewed keeps the file locked so the
+// lease can't be renewed. Once the lease runs out, the handler's context is
+// cancelled, because another worker may already be running the job.
+func TestWorkStopsAJobWhoseLeaseCantBeRenewed(t *testing.T) {
+	q, path := openTemp(t, WithBusyTimeout(50*time.Millisecond))
+	must[int64](t)(q.Enqueue(bg, "q", nil))
+	other, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	lock, err := other.Conn(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	stopped := make(chan time.Duration, 1)
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	go q.Work(ctx, "q", func(ctx context.Context, j *Job) error {
+		start := time.Now()
+		if _, err := lock.ExecContext(bg, "BEGIN IMMEDIATE"); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		stopped <- time.Since(start)
+		lock.ExecContext(bg, "ROLLBACK")
+		return ctx.Err()
+	}, Lease(300*time.Millisecond), PollInterval(20*time.Millisecond))
+	select {
+	case d := <-stopped:
+		if d < 200*time.Millisecond || d > 2*time.Second {
+			t.Fatalf("the handler was stopped after %s", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler kept running after its lease ran out")
+	}
+}
+
+func TestWorkReturnsErrClosed(t *testing.T) {
+	q, _ := openTemp(t)
+	done := make(chan error)
+	go func() {
+		done <- q.Work(bg, "q", func(context.Context, *Job) error { return nil }, PollInterval(10*time.Millisecond))
+	}()
+	time.Sleep(50 * time.Millisecond)
+	q.Close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("Work returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Work didn't return")
+	}
 }

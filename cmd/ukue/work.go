@@ -20,11 +20,14 @@ import (
 	"github.com/ukue-queue/ukue"
 )
 
-// Exit codes a command can use to steer what happens to its job.
-const (
-	exitPermanent = 65 // the payload is bad: send the job straight to dead letters
-	exitTempFail  = 75 // try again after the usual delay (any other non-zero code does the same)
-)
+// exitPermanent is the exit status that sends a job straight to the dead
+// letters: the payload is bad, and trying again won't help. Status 0 marks
+// the job done, and any other status fails the attempt.
+const exitPermanent = 65
+
+// killDelay is how long a command gets to stop after SIGTERM before it, and
+// everything it started, is killed.
+var killDelay = 10 * time.Second
 
 func cmdWork(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := newFlags("work", "work [options] FILE QUEUE -- COMMAND [ARG...]", stderr)
@@ -35,7 +38,7 @@ func cmdWork(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	grace := fs.Duration("grace", 30*time.Second, "after Ctrl-C or SIGTERM, how long running commands may finish before they are stopped")
 	keepDone := fs.Bool("keep-done", false, "keep finished jobs in the file instead of deleting them")
 	quiet := fs.Bool("quiet", false, "print only warnings and errors")
-	pos, command, err := parse(fs, args)
+	pos, command, err := parseTail(fs, args)
 	if err != nil {
 		return err
 	}
@@ -48,8 +51,11 @@ func cmdWork(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if *timeout < 0 {
 		return errUsage{"--timeout can't be negative"}
 	}
+	if _, err := exec.LookPath(command[0]); err != nil {
+		return errUsage{fmt.Sprintf("can't run %q: %v", command[0], unwrapExec(err))}
+	}
 	file, queue := pos[0], pos[1]
-	q, err := open(file, true, ukue.WithKeepDone(*keepDone))
+	q, err := open(file, false, ukue.WithKeepDone(*keepDone))
 	if err != nil {
 		return err
 	}
@@ -120,7 +126,9 @@ func (t *tail) String() string {
 }
 
 // runCommand runs the worker's command for one job: the payload goes to its
-// standard input and the job's details to its environment.
+// standard input and the job's details to its environment. When ctx ends,
+// the command and everything it started get SIGTERM, then SIGKILL after
+// killDelay if they're still running.
 func runCommand(ctx context.Context, command []string, job *ukue.Job, file string, stdout, stderr io.Writer, timeout time.Duration) error {
 	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
 	cmd.Stdin = bytes.NewReader(job.Payload)
@@ -135,11 +143,33 @@ func runCommand(ctx context.Context, command []string, job *ukue.Job, file strin
 		"UKUE_MAX_ATTEMPTS="+strconv.Itoa(job.MaxAttempts),
 	)
 	setProcessGroup(cmd)
-	cmd.Cancel = func() error { return killProcessGroup(cmd) }
-	cmd.WaitDelay = 5 * time.Second
+	var mu sync.Mutex
+	var killTimer *time.Timer
+	cmd.Cancel = func() error {
+		mu.Lock()
+		killTimer = time.AfterFunc(killDelay, func() { killProcessGroup(cmd) })
+		mu.Unlock()
+		return terminateProcessGroup(cmd)
+	}
+	cmd.WaitDelay = killDelay
 
 	err := cmd.Run()
+	mu.Lock()
+	if killTimer != nil {
+		killTimer.Stop()
+	}
+	mu.Unlock()
+	if ctx.Err() != nil {
+		// Leave nothing behind that the command started.
+		killProcessGroup(cmd)
+	}
 	if err == nil {
+		return nil
+	}
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		// The command exited 0, but something it started in the background
+		// kept its output open. The job is done.
+		fmt.Fprintf(stderr, "ukue: job %d: the command finished, but a process it started still holds its output\n", job.ID)
 		return nil
 	}
 	detail := errTail.String()
@@ -159,6 +189,14 @@ func runCommand(ctx context.Context, command []string, job *ukue.Job, file strin
 		return e
 	}
 	return withDetail(fmt.Errorf("could not run the command: %w", err), detail)
+}
+
+func unwrapExec(err error) error {
+	var ee *exec.Error
+	if errors.As(err, &ee) {
+		return ee.Err
+	}
+	return err
 }
 
 func withDetail(err error, detail string) error {

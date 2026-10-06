@@ -9,6 +9,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -39,6 +41,14 @@ type Options struct {
 	// Logger receives a line for each request that fails on the server's
 	// side. By default nothing is logged.
 	Logger *slog.Logger
+	// Hosts, when not empty, lists the host names requests may be addressed
+	// to, such as "localhost". Requests naming any other host get 403. A
+	// server without a token should set it, so that a web page can't reach
+	// the server through a DNS name that points at this machine.
+	Hosts []string
+	// Stop, when closed, makes claims that are waiting for a job answer 204
+	// at once, so the server can shut down without waiting for them.
+	Stop <-chan struct{}
 }
 
 type api struct {
@@ -76,7 +86,38 @@ func New(q *ukue.Queue, o Options) http.Handler {
 	mux.HandleFunc("GET /v1/stats", a.auth(a.stats))
 	mux.HandleFunc("POST /v1/retry", a.auth(a.retryAll))
 	mux.HandleFunc("POST /v1/purge", a.auth(a.purge))
-	return jsonErrors(mux)
+
+	var h http.Handler = jsonErrors(mux)
+	// Web pages from other origins can't change anything through the API,
+	// even when the browser runs on the same machine as the server.
+	cop := http.NewCrossOriginProtection()
+	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusForbidden, "requests from other web pages aren't allowed")
+	}))
+	h = cop.Handler(h)
+	if len(o.Hosts) > 0 {
+		h = hostCheck(o.Hosts, h)
+	}
+	return h
+}
+
+// hostCheck refuses requests addressed to a host name not on the list.
+func hostCheck(hosts []string, next http.Handler) http.Handler {
+	allowed := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		allowed[strings.ToLower(strings.Trim(h, "[]"))] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if !allowed[strings.ToLower(strings.Trim(host, "[]"))] {
+			writeErr(w, http.StatusForbidden, "this server only answers requests addressed to "+strings.Join(hosts, ", "))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // jsonErrors answers requests that match no endpoint with a JSON error, as
@@ -188,6 +229,10 @@ func (a *api) readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad JSON: "+err.Error())
+		return false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		writeErr(w, http.StatusBadRequest, "bad JSON: there is more after the end of the object")
 		return false
 	}
 	return true
@@ -377,6 +422,12 @@ func (a *api) claim(w http.ResponseWriter, r *http.Request) {
 			a.opErr(w, r, err)
 			return
 		}
+		if job != nil && ctx.Err() != nil {
+			// The client left while the claim went through; put the job
+			// back so it doesn't wait out the lease.
+			_ = a.q.Release(context.WithoutCancel(ctx), job)
+			return
+		}
 		if job != nil {
 			writeJSON(w, http.StatusOK, jobJSON(job))
 			return
@@ -392,6 +443,10 @@ func (a *api) claim(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			t.Stop()
+			return
+		case <-a.o.Stop:
+			t.Stop()
+			w.WriteHeader(http.StatusNoContent)
 			return
 		case <-wake:
 		case <-t.C:

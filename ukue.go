@@ -9,8 +9,10 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -67,11 +69,12 @@ type Queue struct {
 }
 
 type options struct {
-	busyTimeout time.Duration
-	keepDone    bool
-	maxAttempts int
-	backoffBase time.Duration
-	backoffMax  time.Duration
+	busyTimeout  time.Duration
+	keepDone     bool
+	maxAttempts  int
+	backoffBase  time.Duration
+	backoffMax   time.Duration
+	existingOnly bool
 }
 
 // Option configures a Queue.
@@ -102,6 +105,14 @@ func WithMaxAttempts(n int) Option {
 // seconds and 1 hour.
 func WithBackoff(base, max time.Duration) Option {
 	return func(o *options) { o.backoffBase, o.backoffMax = base, max }
+}
+
+// WithExistingOnly makes Open and OpenDB fail with an error, instead of
+// creating anything, when the file doesn't exist or doesn't hold the ukue
+// tables yet. The file is then never changed by opening it. The ukue command
+// uses it for everything except init and add.
+func WithExistingOnly() Option {
+	return func(o *options) { o.existingOnly = true }
 }
 
 func defaultOptions() options {
@@ -138,12 +149,24 @@ func Open(path string, opts ...Option) (*Queue, error) {
 	if name == "" {
 		return nil, errNoDriver
 	}
+	memory := isMemory(path)
+	if !memory && slices.ContainsFunc(opts, isExistingOnly) {
+		if _, err := os.Stat(path); err != nil {
+			return nil, fmt.Errorf("ukue: %w", err)
+		}
+	}
 	db, err := sql.Open(name, path)
 	if err != nil {
 		return nil, fmt.Errorf("ukue: open %s: %w", path, err)
 	}
-	db.SetMaxOpenConns(8)
-	db.SetMaxIdleConns(8)
+	if memory {
+		// Every connection to an in-memory database gets a database of its
+		// own, so the Queue must keep to one.
+		db.SetMaxOpenConns(1)
+	} else {
+		db.SetMaxOpenConns(8)
+		db.SetMaxIdleConns(8)
+	}
 	q, err := newQueue(db, true, opts)
 	if err != nil {
 		db.Close()
@@ -155,12 +178,24 @@ func Open(path string, opts ...Option) (*Queue, error) {
 // OpenDB uses a database the program already opened. The ukue tables are
 // created in it if they aren't there yet, next to any tables of its own,
 // which lets EnqueueTx add a job in the same transaction as the program's own
-// data. Close doesn't close db.
+// data. When ukue creates its tables it also switches the database to WAL
+// mode, which lets readers carry on while a writer commits; it never changes
+// the mode on later opens. Close doesn't close db.
 func OpenDB(db *sql.DB, opts ...Option) (*Queue, error) {
 	if db == nil {
 		return nil, invalidf("nil database")
 	}
 	return newQueue(db, false, opts)
+}
+
+func isExistingOnly(opt Option) bool {
+	var o options
+	opt(&o)
+	return o.existingOnly
+}
+
+func isMemory(path string) bool {
+	return path == ":memory:" || strings.HasPrefix(path, "file::memory:") || strings.Contains(path, "mode=memory")
 }
 
 func driverName() string {
@@ -277,6 +312,14 @@ func (q *Queue) writeTx(ctx context.Context, fn func(c *sql.Conn) error) error {
 	if _, err := c.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("ukue: begin: %w", err)
 	}
+	// A panic must not send the connection back to the pool with the write
+	// lock still held.
+	defer func() {
+		if r := recover(); r != nil {
+			rollback(c)
+			panic(r)
+		}
+	}()
 	if err := fn(c); err != nil {
 		rollback(c)
 		return err
@@ -308,7 +351,7 @@ var schema = []string{
 	queue        TEXT    NOT NULL CHECK (length(queue) BETWEEN 1 AND 200),
 	payload      BLOB    NOT NULL,
 	state        TEXT    NOT NULL DEFAULT 'ready' CHECK (state IN ('ready', 'running', 'done', 'dead')),
-	priority     INTEGER NOT NULL DEFAULT 0,
+	priority     INTEGER NOT NULL DEFAULT 0 CHECK (priority BETWEEN -100 AND 100),
 	attempts     INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
 	max_attempts INTEGER NOT NULL DEFAULT 10 CHECK (max_attempts >= 1),
 	run_at       INTEGER NOT NULL DEFAULT (CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)),
@@ -330,6 +373,14 @@ func (q *Queue) init(ctx context.Context, standalone bool) error {
 		return err
 	}
 	defer c.Close()
+
+	// A file that already holds the ukue tables is only checked.
+	if done, err := checkFormat(ctx, c); err != nil || done {
+		return err
+	}
+	if q.o.existingOnly {
+		return errors.New("ukue: not a ukue file (it has no ukue_meta table); create it with \"ukue init\" or open it without WithExistingOnly")
+	}
 
 	// WAL lets readers carry on while a writer commits. The mode is stored
 	// in the file, so every program that opens it later uses WAL too. On a
@@ -359,28 +410,38 @@ func (q *Queue) init(ctx context.Context, standalone bool) error {
 	return nil
 }
 
-func (q *Queue) initSchema(ctx context.Context, c *sql.Conn, standalone bool) error {
+// checkFormat reports whether the ukue tables are already there, after
+// checking that their format version is one this package reads.
+func checkFormat(ctx context.Context, c *sql.Conn) (bool, error) {
 	var n int
 	if err := c.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ukue_meta'`).Scan(&n); err != nil {
-		return fmt.Errorf("ukue: read schema: %w", err)
+		return false, fmt.Errorf("ukue: read schema: %w", err)
 	}
-	if n == 1 {
-		var v string
-		err := c.QueryRowContext(ctx, `SELECT value FROM ukue_meta WHERE key = 'format_version'`).Scan(&v)
-		if errors.Is(err, sql.ErrNoRows) {
-			return errors.New("ukue: not a ukue file: the ukue_meta table has no format_version")
-		}
-		if err != nil {
-			return fmt.Errorf("ukue: read format version: %w", err)
-		}
-		ver, err := strconv.Atoi(v)
-		if err != nil || ver < 1 {
-			return fmt.Errorf("ukue: not a ukue file: format_version is %q", v)
-		}
-		if ver > FormatVersion {
-			return fmt.Errorf("ukue: the file uses format version %d, and this ukue reads up to version %d; update ukue", ver, FormatVersion)
-		}
-		return nil
+	if n == 0 {
+		return false, nil
+	}
+	var v string
+	err := c.QueryRowContext(ctx, `SELECT value FROM ukue_meta WHERE key = 'format_version'`).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, errors.New("ukue: not a ukue file: the ukue_meta table has no format_version")
+	}
+	if err != nil {
+		return false, fmt.Errorf("ukue: read format version: %w", err)
+	}
+	ver, err := strconv.Atoi(v)
+	if err != nil || ver < 1 {
+		return false, fmt.Errorf("ukue: not a ukue file: format_version is %q", v)
+	}
+	if ver > FormatVersion {
+		return false, fmt.Errorf("ukue: the file uses format version %d, and this ukue reads up to version %d; update ukue", ver, FormatVersion)
+	}
+	return true, nil
+}
+
+func (q *Queue) initSchema(ctx context.Context, c *sql.Conn, standalone bool) error {
+	// Another process may have created the tables since the first look.
+	if done, err := checkFormat(ctx, c); err != nil || done {
+		return err
 	}
 
 	if standalone {

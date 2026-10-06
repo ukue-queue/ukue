@@ -1,26 +1,26 @@
 # Every test, verbose
-# recorded 2026-10-06 11:11 UTC with go1.27.1 linux/amd64
+# recorded 2026-10-06 14:41 UTC with go1.27.1 linux/amd64
 # Linux 6.18.44-fc-v70, Intel(R) Xeon(R) Processor @ 2.10GHz, 2 CPUs
 # command: go test -count=1 -v ./...
 
 === RUN   TestProcessesShareAFile
-    process_test.go:150: 2000 jobs, 4 processes with 4 workers each: every job ran exactly once, in 4.417s (453 jobs/s, each run writing a row of its own as well)
---- PASS: TestProcessesShareAFile (5.16s)
+    process_test.go:150: 2000 jobs, 4 processes with 4 workers each: every job ran exactly once, in 4.301s (465 jobs/s, each run writing a row of its own as well)
+--- PASS: TestProcessesShareAFile (4.94s)
 === RUN   TestKilledWorkersJobRunsAgain
     process_test.go:209: 20 workers killed with SIGKILL while holding a job: all 20 jobs came back after the 300ms lease and finished on the second attempt
---- PASS: TestKilledWorkersJobRunsAgain (7.24s)
+--- PASS: TestKilledWorkersJobRunsAgain (7.29s)
 === RUN   TestChaosKills
-    process_test.go:272: 8000 jobs, 250 SIGKILLs at random moments in 19.787s: 0 jobs lost, 0 stuck, integrity_check ok (5 checks during the run and one after); 8388 runs in all: 387 jobs ran more than once because their worker was killed between starting the work and marking it done; the most attempts any job needed was 3
---- PASS: TestChaosKills (22.09s)
+    process_test.go:272: 8000 jobs, 250 SIGKILLs at random moments in 20.472s: 0 jobs lost, 0 stuck, integrity_check ok (5 checks during the run and one after); 8329 runs in all: 329 jobs ran more than once because their worker was killed between starting the work and marking it done; the most attempts any job needed was 2
+--- PASS: TestChaosKills (22.75s)
 === RUN   TestPythonAddsJobs
 --- PASS: TestPythonAddsJobs (0.12s)
 === RUN   TestPythonAndGoShareAFileAtOnce
---- PASS: TestPythonAndGoShareAFileAtOnce (0.55s)
+--- PASS: TestPythonAndGoShareAFileAtOnce (0.48s)
 === RUN   TestManyScheduledJobsDontSlowClaims
-    scale_test.go:71: an empty claim with 100000 jobs scheduled for later: 42µs on average
-    scale_test.go:71: finding the next due time with 100000 jobs scheduled for later: 44µs on average
-    scale_test.go:71: adding a due job and claiming it with 100000 jobs scheduled for later: 1.577ms on average
---- PASS: TestManyScheduledJobsDontSlowClaims (1.24s)
+    scale_test.go:71: an empty claim with 100000 jobs scheduled for later: 21µs on average
+    scale_test.go:71: finding the next due time with 100000 jobs scheduled for later: 21µs on average
+    scale_test.go:71: adding a due job and claiming it with 100000 jobs scheduled for later: 1.094ms on average
+--- PASS: TestManyScheduledJobsDontSlowClaims (0.92s)
 === RUN   TestOpenWritesFormat
 --- PASS: TestOpenWritesFormat (0.01s)
 === RUN   TestOpenDBSharesAFile
@@ -40,21 +40,31 @@
 === RUN   TestReleaseDoesNotUseAnAttempt
 --- PASS: TestReleaseDoesNotUseAnAttempt (0.01s)
 === RUN   TestRetryPurgeDeleteKeepDone
---- PASS: TestRetryPurgeDeleteKeepDone (0.02s)
+--- PASS: TestRetryPurgeDeleteKeepDone (0.01s)
 === RUN   TestListAndStats
 --- PASS: TestListAndStats (0.01s)
 === RUN   TestBadArguments
---- PASS: TestBadArguments (0.00s)
+--- PASS: TestBadArguments (0.01s)
 === RUN   TestErrorTextIsCut
 --- PASS: TestErrorTextIsCut (0.01s)
 === RUN   TestClosedQueue
 --- PASS: TestClosedQueue (0.00s)
 === RUN   TestNoDriverMessage
 --- PASS: TestNoDriverMessage (0.00s)
+=== RUN   TestPriorityRangeIsInTheFile
+--- PASS: TestPriorityRangeIsInTheFile (0.01s)
+=== RUN   TestExistingOnlyChangesNothing
+--- PASS: TestExistingOnlyChangesNothing (0.01s)
+=== RUN   TestJournalModeIsSetOnlyWhenTheTablesAreCreated
+--- PASS: TestJournalModeIsSetOnlyWhenTheTablesAreCreated (0.01s)
+=== RUN   TestInMemoryQueueWorksFromManyGoroutines
+--- PASS: TestInMemoryQueueWorksFromManyGoroutines (0.04s)
+=== RUN   TestBackoffDoesNotOverflow
+--- PASS: TestBackoffDoesNotOverflow (0.01s)
 === RUN   TestWorkRunsEveryJob
---- PASS: TestWorkRunsEveryJob (0.61s)
+--- PASS: TestWorkRunsEveryJob (0.51s)
 === RUN   TestWorkRetriesAndRecoversFromPanics
---- PASS: TestWorkRetriesAndRecoversFromPanics (0.05s)
+--- PASS: TestWorkRetriesAndRecoversFromPanics (0.06s)
 === RUN   TestWorkRenewsTheLeaseOfALongJob
 --- PASS: TestWorkRenewsTheLeaseOfALongJob (1.01s)
 === RUN   TestWorkShutdownPutsJobsBack
@@ -62,23 +72,43 @@
 === RUN   TestWorkFinishesRunningJobsWithinGrace
 --- PASS: TestWorkFinishesRunningJobsWithinGrace (0.21s)
 === RUN   TestGoroutinesClaimEachJobOnce
-    worker_test.go:249: 3000 jobs claimed and acknowledged by 16 goroutines in 2.396s: 1252 jobs/s
---- PASS: TestGoroutinesClaimEachJobOnce (3.15s)
+    worker_test.go:250: 3000 jobs claimed and acknowledged by 16 goroutines in 2.074s: 1447 jobs/s
+--- PASS: TestGoroutinesClaimEachJobOnce (2.78s)
+=== RUN   TestWorkRetriesAckWhileTheFileIsLocked
+--- PASS: TestWorkRetriesAckWhileTheFileIsLocked (1.67s)
+=== RUN   TestWorkStopsAJobWhoseLeaseCantBeRenewed
+--- PASS: TestWorkStopsAJobWhoseLeaseCantBeRenewed (0.36s)
+=== RUN   TestWorkReturnsErrClosed
+--- PASS: TestWorkReturnsErrClosed (0.06s)
 PASS
-ok  	github.com/ukue-queue/ukue	41.626s
+ok  	github.com/ukue-queue/ukue	43.385s
 === RUN   TestCommands
 --- PASS: TestCommands (0.03s)
 === RUN   TestWorkRunsACommandPerJob
 --- PASS: TestWorkRunsACommandPerJob (14.02s)
 === RUN   TestServeNeedsATokenOffThisMachine
---- PASS: TestServeNeedsATokenOffThisMachine (0.30s)
+--- PASS: TestServeNeedsATokenOffThisMachine (0.31s)
+=== RUN   TestFlagErrorsExitTwoAndPrintOnce
+--- PASS: TestFlagErrorsExitTwoAndPrintOnce (0.00s)
+=== RUN   TestDoubleDashKeepsThePayload
+--- PASS: TestDoubleDashKeepsThePayload (0.01s)
+=== RUN   TestOtherSQLiteFilesAreLeftAlone
+--- PASS: TestOtherSQLiteFilesAreLeftAlone (0.00s)
+=== RUN   TestWorkChecksItsCommandAndFile
+--- PASS: TestWorkChecksItsCommandAndFile (0.01s)
+=== RUN   TestWorkExitZeroIsDoneEvenWithABackgroundChild
+--- PASS: TestWorkExitZeroIsDoneEvenWithABackgroundChild (4.01s)
+=== RUN   TestWorkStopsCommandsWithSIGTERMFirst
+--- PASS: TestWorkStopsCommandsWithSIGTERMFirst (1.21s)
+=== RUN   TestServeEndsWaitingClaimsOnShutdown
+--- PASS: TestServeEndsWaitingClaimsOnShutdown (0.31s)
 PASS
-ok  	github.com/ukue-queue/ukue/cmd/ukue	14.362s
+ok  	github.com/ukue-queue/ukue/cmd/ukue	19.917s
 ?   	github.com/ukue-queue/ukue/examples/go	[no test files]
 === RUN   TestAddClaimAck
---- PASS: TestAddClaimAck (0.05s)
+--- PASS: TestAddClaimAck (0.01s)
 === RUN   TestFailRetryAndBulk
---- PASS: TestFailRetryAndBulk (0.03s)
+--- PASS: TestFailRetryAndBulk (0.02s)
 === RUN   TestDelayAndRunAt
 --- PASS: TestDelayAndRunAt (0.01s)
 === RUN   TestBinaryPayload
@@ -86,10 +116,18 @@ ok  	github.com/ukue-queue/ukue/cmd/ukue	14.362s
 === RUN   TestClaimWaitsForNewJobs
 --- PASS: TestClaimWaitsForNewJobs (0.77s)
 === RUN   TestToken
---- PASS: TestToken (0.02s)
+--- PASS: TestToken (0.01s)
 === RUN   TestBadRequests
 --- PASS: TestBadRequests (0.51s)
 === RUN   TestPythonHTTPWorker
---- PASS: TestPythonHTTPWorker (0.20s)
+--- PASS: TestPythonHTTPWorker (0.15s)
+=== RUN   TestBrowsersFromOtherSitesAreRefused
+--- PASS: TestBrowsersFromOtherSitesAreRefused (0.01s)
+=== RUN   TestHostsLimitsWhichNamesAnswer
+--- PASS: TestHostsLimitsWhichNamesAnswer (0.01s)
+=== RUN   TestTrailingDataIsRefused
+--- PASS: TestTrailingDataIsRefused (0.01s)
+=== RUN   TestStopEndsWaitingClaims
+--- PASS: TestStopEndsWaitingClaims (0.21s)
 PASS
-ok  	github.com/ukue-queue/ukue/server	1.605s
+ok  	github.com/ukue-queue/ukue/server	1.730s

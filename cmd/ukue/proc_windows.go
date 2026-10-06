@@ -15,9 +15,17 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 }
 
-func killProcessGroup(cmd *exec.Cmd) error {
+// terminateProcessGroup stops the command. Windows has no SIGTERM, so the
+// command is ended at once; processes it started itself keep running.
+func terminateProcessGroup(cmd *exec.Cmd) error {
 	if cmd.Process == nil {
 		return nil
 	}
 	return cmd.Process.Kill()
+}
+
+func killProcessGroup(cmd *exec.Cmd) {
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
 }

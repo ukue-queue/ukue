@@ -8,6 +8,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -470,6 +472,10 @@ func TestBadArguments(t *testing.T) {
 		"unknown state":   second(ParseState("waiting")),
 		"list bad state":  second(q.List(bg, ListFilter{State: "x"})),
 		"nil handler":     q.Work(bg, "q", nil),
+		"nul in queue":    second(q.Enqueue(bg, "a\x00b", nil)),
+		"priority high":   second(q.Enqueue(bg, "q", nil, Priority(MaxPriority+1))),
+		"priority low":    second(q.Enqueue(bg, "q", nil, Priority(MinPriority-1))),
+		"tiny lease":      second(q.Claim(bg, "q", 500*time.Microsecond)),
 		"zero concurency": q.Work(bg, "q", func(context.Context, *Job) error { return nil }, Concurrency(0)),
 	} {
 		if !errors.Is(err, ErrInvalid) {
@@ -514,5 +520,113 @@ func TestNoDriverMessage(t *testing.T) {
 	}
 	if !strings.Contains(errNoDriver.Error(), "github.com/mattn/go-sqlite3") {
 		t.Fatal(errNoDriver)
+	}
+}
+
+func TestPriorityRangeIsInTheFile(t *testing.T) {
+	q, _ := openTemp(t)
+	for _, p := range []int{MinPriority, MaxPriority} {
+		if _, err := q.Enqueue(bg, "q", nil, Priority(p)); err != nil {
+			t.Fatalf("priority %d: %v", p, err)
+		}
+	}
+	// Other writers meet the same limit, through the CHECK constraint.
+	if _, err := q.DB().Exec(`INSERT INTO ukue_jobs (queue, payload, priority) VALUES ('q', x'', 1000)`); err == nil {
+		t.Fatal("the file took priority 1000")
+	}
+}
+
+func TestExistingOnlyChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Open(filepath.Join(dir, "missing.ukue"), WithExistingOnly()); err == nil {
+		t.Fatal("opened a missing file")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "missing.ukue")); !os.IsNotExist(err) {
+		t.Fatal("a missing file was created")
+	}
+	app := filepath.Join(dir, "app.db")
+	db, err := sql.Open("sqlite3", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+	if _, err := Open(app, WithExistingOnly()); err == nil || !strings.Contains(err.Error(), "not a ukue file") {
+		t.Fatalf("opened an app database: %v", err)
+	}
+	var mode string
+	db.QueryRow("PRAGMA journal_mode").Scan(&mode)
+	if mode != "delete" {
+		t.Fatalf("journal mode changed to %s", mode)
+	}
+	// A real ukue file opens fine.
+	q, path := openTemp(t)
+	q.Close()
+	q2, err := Open(path, WithExistingOnly())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q2.Close()
+}
+
+func TestJournalModeIsSetOnlyWhenTheTablesAreCreated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := OpenDB(db); err != nil {
+		t.Fatal(err)
+	}
+	var mode string
+	db.QueryRow("PRAGMA journal_mode").Scan(&mode)
+	if mode != "wal" {
+		t.Fatalf("first open: journal mode %s", mode)
+	}
+	// The app chooses another mode; opening again leaves it.
+	db.QueryRow("PRAGMA journal_mode = DELETE").Scan(&mode)
+	if _, err := OpenDB(db); err != nil {
+		t.Fatal(err)
+	}
+	db.QueryRow("PRAGMA journal_mode").Scan(&mode)
+	if mode != "delete" {
+		t.Fatalf("second open changed the journal mode to %s", mode)
+	}
+}
+
+func TestInMemoryQueueWorksFromManyGoroutines(t *testing.T) {
+	q, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				if _, err := q.Enqueue(bg, "q", nil); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := q.Claim(bg, "q", time.Minute); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestBackoffDoesNotOverflow(t *testing.T) {
+	q, _ := openTemp(t, WithBackoff(time.Second, math.MaxInt64))
+	for _, attempt := range []int{1, 30, 62, 63, 64, 1000} {
+		if d := q.backoff(attempt); d <= 0 {
+			t.Fatalf("attempt %d: backoff %d", attempt, d)
+		}
 	}
 }

@@ -46,16 +46,27 @@ Run "ukue COMMAND -h" for a command's options.
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The first Ctrl-C or SIGTERM asks ukue to stop cleanly; a second one
+	// ends it at once.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
 
-// errUsage means the command line was wrong; run prints the usage and
+// errUsage means the command line was wrong; run prints the message and
 // exits with status 2.
 type errUsage struct{ msg string }
 
 func (e errUsage) Error() string { return e.msg }
+
+// errFlag is a flag error the flag package has already printed.
+type errFlag struct{ err error }
+
+func (e errFlag) Error() string { return e.err.Error() }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
@@ -102,6 +113,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
+	var fe errFlag
+	if errors.As(err, &fe) {
+		return 2
+	}
 	var ue errUsage
 	if errors.As(err, &ue) {
 		fmt.Fprintf(stderr, "ukue %s: %s\n", cmd, ue.msg)
@@ -111,9 +126,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	return 1
 }
 
-// parse reads flags that may come before, between or after the positional
-// arguments. Everything after a "--" is returned separately, untouched.
-func parse(fs *flag.FlagSet, args []string) (pos, tail []string, err error) {
+// parseTail reads flags that may come before, between or after the
+// positional arguments. Everything after a "--" is returned separately,
+// untouched.
+func parseTail(fs *flag.FlagSet, args []string) (pos, tail []string, err error) {
 	for i, a := range args {
 		if a == "--" {
 			args, tail = args[:i], args[i+1:]
@@ -122,7 +138,10 @@ func parse(fs *flag.FlagSet, args []string) (pos, tail []string, err error) {
 	}
 	for {
 		if err := fs.Parse(args); err != nil {
-			return nil, nil, err
+			if errors.Is(err, flag.ErrHelp) {
+				return nil, nil, err
+			}
+			return nil, nil, errFlag{err}
 		}
 		args = fs.Args()
 		if len(args) == 0 {
@@ -131,6 +150,14 @@ func parse(fs *flag.FlagSet, args []string) (pos, tail []string, err error) {
 		pos = append(pos, args[0])
 		args = args[1:]
 	}
+}
+
+// parse is parseTail for commands that take no command line of their own:
+// anything after "--" is a positional argument too, such as a payload that
+// starts with a dash.
+func parse(fs *flag.FlagSet, args []string) (pos, tail []string, err error) {
+	pos, tail, err = parseTail(fs, args)
+	return append(pos, tail...), nil, err
 }
 
 func newFlags(name, synopsis string, stderr io.Writer) *flag.FlagSet {
@@ -148,8 +175,9 @@ func newFlags(name, synopsis string, stderr io.Writer) *flag.FlagSet {
 	return fs
 }
 
-// open opens an existing ukue file. Commands that only read or change jobs
-// don't create a file, so a mistyped path is caught.
+// open opens a ukue file. Only init and add create one: every other command
+// needs a file that already holds the ukue tables, and leaves anything else
+// untouched, so a mistyped path is caught.
 func open(path string, create bool, opts ...ukue.Option) (*ukue.Queue, error) {
 	if !create {
 		if _, err := os.Stat(path); err != nil {
@@ -158,8 +186,13 @@ func open(path string, create bool, opts ...ukue.Option) (*ukue.Queue, error) {
 			}
 			return nil, err
 		}
+		opts = append(opts, ukue.WithExistingOnly())
 	}
-	return ukue.Open(path, opts...)
+	q, err := ukue.Open(path, opts...)
+	if err != nil && !create && strings.Contains(err.Error(), "not a ukue file") {
+		return nil, fmt.Errorf("%s is not a ukue file", path)
+	}
+	return q, err
 }
 
 func cmdInit(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -197,9 +230,9 @@ func cmdAdd(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	if len(pos) == 3 && pos[2] != "-" {
 		payload = []byte(pos[2])
 	} else {
-		payload, err = io.ReadAll(stdin)
+		payload, err = readPayload(ctx, stdin, stderr)
 		if err != nil {
-			return fmt.Errorf("read payload: %w", err)
+			return err
 		}
 	}
 	var opts []ukue.EnqueueOption
@@ -279,7 +312,7 @@ func cmdStats(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		if !s.OldestDue.IsZero() {
 			wait = time.Since(s.OldestDue).Round(time.Second).String()
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n", s.Queue, s.Ready, s.Delayed, s.Running, s.Expired, s.Dead, s.Done, wait)
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n", printable(s.Queue), s.Ready, s.Delayed, s.Running, s.Expired, s.Dead, s.Done, wait)
 	}
 	return tw.Flush()
 }
@@ -329,7 +362,7 @@ func cmdList(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tQUEUE\tSTATE\tTRIES\tRUN AT\tPAYLOAD\tLAST ERROR")
 	for _, j := range jobs {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%d/%d\t%s\t%s\t%s\n", j.ID, j.Queue, j.State, j.Attempts, j.MaxAttempts,
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%d/%d\t%s\t%s\t%s\n", j.ID, printable(j.Queue), j.State, j.Attempts, j.MaxAttempts,
 			j.RunAt.UTC().Format("2006-01-02 15:04:05"), preview(j.Payload, 40), preview([]byte(j.LastError), 50))
 	}
 	return tw.Flush()
@@ -362,17 +395,17 @@ func cmdShow(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return printJSON(stdout, infoMap(j))
 	}
 	fmt.Fprintf(stdout, "id:          %d\nqueue:       %s\nstate:       %s\ntries:       %d of %d\npriority:    %d\nrun at:      %s\n",
-		j.ID, j.Queue, j.State, j.Attempts, j.MaxAttempts, j.Priority, j.RunAt.UTC().Format(time.RFC3339))
+		j.ID, printable(j.Queue), j.State, j.Attempts, j.MaxAttempts, j.Priority, j.RunAt.UTC().Format(time.RFC3339))
 	if !j.LeaseUntil.IsZero() {
 		fmt.Fprintf(stdout, "lease until: %s\n", j.LeaseUntil.UTC().Format(time.RFC3339))
 	}
 	fmt.Fprintf(stdout, "created:     %s\nupdated:     %s\n", j.CreatedAt.UTC().Format(time.RFC3339), j.UpdatedAt.UTC().Format(time.RFC3339))
 	if j.LastError != "" {
-		fmt.Fprintf(stdout, "last error:  %s\n", j.LastError)
+		fmt.Fprintf(stdout, "last error:  %s\n", printable(j.LastError))
 	}
 	fmt.Fprintf(stdout, "payload:     %d bytes\n", len(j.Payload))
 	if utf8.Valid(j.Payload) {
-		fmt.Fprintf(stdout, "%s\n", j.Payload)
+		fmt.Fprintf(stdout, "%s\n", printable(string(j.Payload)))
 	} else {
 		fmt.Fprintln(stdout, "(binary; use --json to get it as base64)")
 	}
@@ -476,11 +509,56 @@ func cmdDelete(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	return nil
 }
 
+// readPayload reads standard input, and gives up if ukue is interrupted
+// while it waits.
+func readPayload(ctx context.Context, stdin io.Reader, stderr io.Writer) ([]byte, error) {
+	if f, ok := stdin.(*os.File); ok {
+		if st, err := f.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
+			fmt.Fprintln(stderr, "Reading the payload from the keyboard; end it with Ctrl-D (Ctrl-Z then Enter on Windows).")
+		}
+	}
+	type result struct {
+		b   []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		b, err := io.ReadAll(stdin)
+		done <- result{b, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return nil, fmt.Errorf("read payload: %w", r.err)
+		}
+		return r.b, nil
+	case <-ctx.Done():
+		return nil, errors.New("interrupted while reading the payload")
+	}
+}
+
+// printable escapes control characters, so a payload or an error message
+// can't send escape sequences to the terminal. Newlines and tabs stay.
+func printable(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0):
+			fmt.Fprintf(&b, "\\x%02x", r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func preview(b []byte, n int) string {
 	if !utf8.Valid(b) {
 		return fmt.Sprintf("(%d bytes, binary)", len(b))
 	}
-	s := strings.Join(strings.Fields(string(b)), " ")
+	s := strings.Join(strings.Fields(printable(string(b))), " ")
 	if utf8.RuneCountInString(s) > n {
 		r := []rune(s)
 		s = string(r[:n-3]) + "..."

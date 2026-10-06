@@ -23,6 +23,9 @@ func checkQueueName(queue string) error {
 	if !utf8.ValidString(queue) {
 		return invalidf("queue name is not valid UTF-8")
 	}
+	if strings.ContainsRune(queue, 0) {
+		return invalidf("queue name contains a NUL character")
+	}
 	switch n := utf8.RuneCountInString(queue); {
 	case n == 0:
 		return invalidf("empty queue name")
@@ -50,6 +53,8 @@ func (q *Queue) insertArgs(queue string, payload []byte, opts []EnqueueOption) (
 		return nil, invalidf("delay can't be negative")
 	case o.delay > 0 && !o.at.IsZero():
 		return nil, invalidf("give a delay or a start time, not both")
+	case o.priority < MinPriority || o.priority > MaxPriority:
+		return nil, invalidf("priority must be from %d to %d", MinPriority, MaxPriority)
 	}
 	now := q.now()
 	runAt := now.Add(o.delay)
@@ -85,8 +90,9 @@ func (q *Queue) Enqueue(ctx context.Context, queue string, payload []byte, opts 
 // EnqueueTx adds a job inside a transaction the program already started on
 // the same database, so the job exists only if the rest of the transaction
 // commits. The Queue must have been made with OpenDB on that database.
-// Workers in this process are woken at once and find the job as soon as the
-// transaction commits, or at their next poll.
+// Workers find the job at their next look after the commit. The commit is as
+// durable as the program's own connection makes it, so set synchronous = FULL
+// there too if the job must survive a power cut.
 func (q *Queue) EnqueueTx(ctx context.Context, tx *sql.Tx, queue string, payload []byte, opts ...EnqueueOption) (int64, error) {
 	args, err := q.insertArgs(queue, payload, opts)
 	if err != nil {
@@ -126,8 +132,11 @@ func (q *Queue) Claim(ctx context.Context, queue string, lease time.Duration) (*
 	if err := checkQueueName(queue); err != nil {
 		return nil, err
 	}
-	if lease <= 0 {
+	if lease == 0 {
 		lease = DefaultLease
+	}
+	if lease < time.Millisecond {
+		return nil, invalidf("lease must be at least a millisecond")
 	}
 	// Look first without the write lock, so idle workers polling an empty
 	// queue don't hold up the programs adding jobs.
@@ -201,8 +210,8 @@ func (q *Queue) mayHaveWork(ctx context.Context, queue string) (bool, error) {
 
 // findDue returns the ID of the job to claim next. It goes down the queue's
 // priorities from the highest, and in each one looks for the oldest due
-// job. Every step is an index lookup, so a long list of jobs scheduled for
-// later doesn't slow it down.
+// job. Every step is an index lookup, and there are at most 201 priorities,
+// so a long list of jobs scheduled for later doesn't slow it down.
 func findDue(ctx context.Context, c *sql.Conn, queue string, nowMs int64) (int64, bool, error) {
 	var pr sql.NullInt64
 	if err := c.QueryRowContext(ctx, `SELECT max(priority) FROM ukue_jobs WHERE queue = ? AND state = 'ready'`, queue).Scan(&pr); err != nil {
@@ -362,8 +371,11 @@ func (q *Queue) Extend(ctx context.Context, job *Job, lease time.Duration) error
 }
 
 func (q *Queue) extend(ctx context.Context, id int64, token string, lease time.Duration) (time.Time, error) {
-	if lease <= 0 {
+	if lease == 0 {
 		lease = DefaultLease
+	}
+	if lease < time.Millisecond {
+		return time.Time{}, invalidf("lease must be at least a millisecond")
 	}
 	now := q.now()
 	untilMs := now.Add(lease).UnixMilli()

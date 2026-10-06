@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -104,6 +105,7 @@ func (q *Queue) Work(ctx context.Context, queue string, h Handler, opts ...WorkO
 	slots := make(chan struct{}, o.concurrency)
 	var wg sync.WaitGroup
 	failures := 0
+	closed := false
 loop:
 	for {
 		select {
@@ -115,7 +117,11 @@ loop:
 		job, err := q.Claim(ctx, queue, o.lease)
 		if err != nil {
 			<-slots
-			if ctx.Err() != nil || errors.Is(err, ErrClosed) {
+			if errors.Is(err, ErrClosed) {
+				closed = true
+				break loop
+			}
+			if ctx.Err() != nil {
 				break loop
 			}
 			failures++
@@ -147,6 +153,9 @@ loop:
 		}()
 	}
 	wg.Wait()
+	if closed {
+		return ErrClosed
+	}
 	return nil
 }
 
@@ -172,7 +181,10 @@ func (q *Queue) run(ctx, jobBase context.Context, job *Job, h Handler, o workOpt
 	defer cancel(nil)
 	bg := context.WithoutCancel(ctx)
 
-	// Renew the lease while the handler runs.
+	// The lease is renewed until the job's result is recorded. leaseUntil
+	// holds the end of the last renewal that went through.
+	var leaseUntil atomic.Int64
+	leaseUntil.Store(job.LeaseUntil.UnixNano())
 	var hb sync.WaitGroup
 	hbStop := make(chan struct{})
 	hb.Add(1)
@@ -185,53 +197,89 @@ func (q *Queue) run(ctx, jobBase context.Context, job *Job, h Handler, o workOpt
 			case <-hbStop:
 				return
 			case <-t.C:
-				if _, err := q.extend(bg, job.ID, job.Token, o.lease); err != nil {
-					if errors.Is(err, ErrLeaseLost) {
-						cancel(errLeaseGone)
-						return
-					}
-					o.log.Warn("lease renewal failed", "queue", job.Queue, "id", job.ID, "err", err)
+				until, err := q.extend(bg, job.ID, job.Token, o.lease)
+				if err == nil {
+					leaseUntil.Store(until.UnixNano())
+					continue
 				}
+				if errors.Is(err, ErrLeaseLost) || time.Now().UnixNano() >= leaseUntil.Load() {
+					// Another worker may hold the job now, so this one stops.
+					cancel(errLeaseGone)
+					return
+				}
+				o.log.Warn("lease renewal failed; trying again", "queue", job.Queue, "id", job.ID, "err", err)
 			}
 		}
 	}()
+	stopHeartbeat := func() {
+		close(hbStop)
+		hb.Wait()
+	}
 
 	err := callHandler(jctx, h, job)
-	close(hbStop)
-	hb.Wait()
-
 	if errors.Is(context.Cause(jctx), errLeaseGone) {
+		stopHeartbeat()
 		o.log.Warn("job lease lost; another worker may run it again", "queue", job.Queue, "id", job.ID)
 		return
 	}
-	if err == nil {
-		if aerr := q.Ack(bg, job); aerr != nil {
-			o.log.Warn("job finished but could not be marked done", "queue", job.Queue, "id", job.ID, "err", aerr)
+
+	// settle records the result, trying again after passing errors such as
+	// a lock held longer than the busy timeout. It gives up when the job is
+	// no longer held or its lease runs out, since then the job runs again
+	// anyway.
+	settle := func(step func() error) error {
+		wait := 50 * time.Millisecond
+		for {
+			serr := step()
+			if serr == nil || errors.Is(serr, ErrLeaseLost) || errors.Is(serr, ErrClosed) || errors.Is(serr, ErrInvalid) {
+				return serr
+			}
+			if errors.Is(context.Cause(jctx), errLeaseGone) || time.Now().Add(wait).UnixNano() >= leaseUntil.Load() {
+				return serr
+			}
+			o.log.Warn("could not record the job's result; trying again", "queue", job.Queue, "id", job.ID, "err", serr)
+			time.Sleep(wait)
+			wait = min(2*wait, 2*time.Second)
+		}
+	}
+
+	switch {
+	case err == nil:
+		aerr := settle(func() error { return q.Ack(bg, job) })
+		stopHeartbeat()
+		if aerr != nil {
+			o.log.Warn("job finished but could not be marked done; it may run again", "queue", job.Queue, "id", job.ID, "err", aerr)
 			return
 		}
 		o.log.Info("job done", "queue", job.Queue, "id", job.ID, "attempt", job.Attempt)
-		return
-	}
-	if ctx.Err() != nil && jctx.Err() != nil {
+
+	case ctx.Err() != nil && jctx.Err() != nil:
 		// Shutting down: give the job back without using up an attempt.
-		if rerr := q.Release(bg, job); rerr != nil {
-			o.log.Warn("could not put job back during shutdown", "queue", job.Queue, "id", job.ID, "err", rerr)
+		rerr := settle(func() error { return q.Release(bg, job) })
+		stopHeartbeat()
+		if rerr != nil {
+			o.log.Warn("could not put the job back during shutdown", "queue", job.Queue, "id", job.ID, "err", rerr)
 			return
 		}
 		o.log.Info("job put back for shutdown", "queue", job.Queue, "id", job.ID)
-		return
+
+	default:
+		var res FailResult
+		ferr := settle(func() (e error) {
+			res, e = q.Fail(bg, job, err)
+			return e
+		})
+		stopHeartbeat()
+		switch {
+		case ferr != nil:
+			o.log.Warn("job failed but that could not be recorded", "queue", job.Queue, "id", job.ID, "err", ferr, "cause", err)
+		case res.State == StateDead:
+			o.log.Warn("job dead", "queue", job.Queue, "id", job.ID, "attempt", job.Attempt, "err", err)
+		default:
+			o.log.Info("job failed, will retry", "queue", job.Queue, "id", job.ID, "attempt", job.Attempt,
+				"retry_at", res.RunAt.UTC().Format(time.RFC3339), "err", err)
+		}
 	}
-	res, ferr := q.Fail(bg, job, err)
-	if ferr != nil {
-		o.log.Warn("job failed but could not be recorded", "queue", job.Queue, "id", job.ID, "err", ferr, "cause", err)
-		return
-	}
-	if res.State == StateDead {
-		o.log.Warn("job dead", "queue", job.Queue, "id", job.ID, "attempt", job.Attempt, "err", err)
-		return
-	}
-	o.log.Info("job failed, will retry", "queue", job.Queue, "id", job.ID, "attempt", job.Attempt,
-		"retry_at", res.RunAt.UTC().Format(time.RFC3339), "err", err)
 }
 
 func callHandler(ctx context.Context, h Handler, job *Job) (err error) {

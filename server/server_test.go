@@ -271,3 +271,64 @@ func TestPythonHTTPWorker(t *testing.T) {
 		t.Fatalf("job after the Python worker: %+v %v", info, err)
 	}
 }
+
+func TestBrowsersFromOtherSitesAreRefused(t *testing.T) {
+	h := newHarness(t, Options{})
+	for _, hdr := range []map[string]string{
+		{"Sec-Fetch-Site": "cross-site"},
+		{"Origin": "https://evil.example"},
+	} {
+		req, _ := http.NewRequest("POST", h.srv.URL+"/v1/jobs", strings.NewReader(`{"queue": "q"}`))
+		req.Header.Set("Content-Type", "text/plain")
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%v: status %d", hdr, resp.StatusCode)
+		}
+	}
+	// Programs that aren't browsers send neither header and get through.
+	h.expect(201, "POST", "/v1/jobs", map[string]any{"queue": "q"})
+}
+
+func TestHostsLimitsWhichNamesAnswer(t *testing.T) {
+	h := newHarness(t, Options{Hosts: []string{"localhost", "127.0.0.1", "::1"}})
+	h.expect(200, "GET", "/v1/stats", nil) // httptest serves on 127.0.0.1
+	req, _ := http.NewRequest("GET", h.srv.URL+"/v1/stats", nil)
+	req.Host = "rebind.evil.example"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+func TestTrailingDataIsRefused(t *testing.T) {
+	h := newHarness(t, Options{})
+	h.expect(400, "POST", "/v1/jobs", `{"queue": "q"} trailing`)
+	h.expect(201, "POST", "/v1/jobs", "{\"queue\": \"q\"}\n\n")
+}
+
+func TestStopEndsWaitingClaims(t *testing.T) {
+	stop := make(chan struct{})
+	h := newHarness(t, Options{Stop: stop})
+	got := make(chan int)
+	go func() {
+		s, _ := h.do("POST", "/v1/claim", map[string]any{"queue": "q", "wait": 25})
+		got <- s
+	}()
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	close(stop)
+	if s := <-got; s != 204 || time.Since(start) > time.Second {
+		t.Fatalf("status %d after %s", s, time.Since(start))
+	}
+}

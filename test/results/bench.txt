@@ -1,15 +1,23 @@
-# Benchmarks: every operation is a committed transaction with synchronous = FULL
-# recorded 2026-10-06 11:13 UTC with go1.27.1 linux/amd64
+# Benchmarks, three runs each: every operation is a committed transaction with synchronous = FULL
+# recorded 2026-10-06 14:45 UTC with go1.27.1 linux/amd64
 # Linux 6.18.44-fc-v70, Intel(R) Xeon(R) Processor @ 2.10GHz, 2 CPUs
-# command: go test -run ^$ -bench . -benchtime 3s .
+# command: go test -run ^$ -bench . -benchtime 3s -count 3 .
 
 goos: linux
 goarch: amd64
 pkg: github.com/ukue-queue/ukue
 cpu: Intel(R) Xeon(R) Processor @ 2.10GHz
-BenchmarkEnqueue-2           	   12999	    279266 ns/op
-BenchmarkEnqueueParallel-2   	   12992	    281639 ns/op
-BenchmarkClaimAck-2          	    4852	    691716 ns/op
-BenchmarkWork-2              	    4051	    976687 ns/op
+BenchmarkEnqueue-2           	   14422	    252986 ns/op
+BenchmarkEnqueue-2           	   15225	    251592 ns/op
+BenchmarkEnqueue-2           	   13304	    251903 ns/op
+BenchmarkEnqueueParallel-2   	   13234	    247249 ns/op
+BenchmarkEnqueueParallel-2   	   12291	    250856 ns/op
+BenchmarkEnqueueParallel-2   	   11854	    283779 ns/op
+BenchmarkClaimAck-2          	    4701	    720062 ns/op
+BenchmarkClaimAck-2          	    4820	    820134 ns/op
+BenchmarkClaimAck-2          	    4116	    778792 ns/op
+BenchmarkWork-2              	    3116	    987697 ns/op
+BenchmarkWork-2              	    2902	   1138673 ns/op
+BenchmarkWork-2              	    3931	   1223165 ns/op
 PASS
-ok  	github.com/ukue-queue/ukue	26.489s
+ok  	github.com/ukue-queue/ukue	74.375s

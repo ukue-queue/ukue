@@ -6,6 +6,7 @@ package ukue
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"time"
 	"unicode/utf8"
@@ -124,9 +125,16 @@ func MaxAttempts(n int) EnqueueOption {
 	return func(o *enqueueOptions) { o.maxAttempts = n }
 }
 
-// Priority sets the job's priority. Among the jobs that are due, workers
-// take the highest priority first, then the oldest. The default is 0, and
-// negative numbers are allowed.
+// Priorities run from MinPriority to MaxPriority. The range is small so
+// that finding the next job stays a handful of index lookups.
+const (
+	MinPriority = -100
+	MaxPriority = 100
+)
+
+// Priority sets the job's priority, from MinPriority to MaxPriority. Among
+// the jobs that are due, workers take the highest priority first, then the
+// oldest. The default is 0.
 func Priority(p int) EnqueueOption {
 	return func(o *enqueueOptions) { o.priority = p }
 }
@@ -181,7 +189,11 @@ func (q *Queue) backoff(attempt int) time.Duration {
 			d = b
 		}
 	}
-	return d + time.Duration(rand.Int64N(int64(d)/10+1))
+	jitter := time.Duration(rand.Int64N(int64(d)/10 + 1))
+	if d > math.MaxInt64-jitter {
+		return math.MaxInt64
+	}
+	return d + jitter
 }
 
 const maxErrorText = 4000

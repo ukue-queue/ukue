@@ -55,15 +55,22 @@ func cmdServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return errors.New("listening beyond this machine needs a token: set UKUE_TOKEN or --token-file, or pass --allow-no-token if something else guards the port")
 	}
 
-	q, err := open(pos[0], true, ukue.WithKeepDone(*keepDone))
+	q, err := open(pos[0], false, ukue.WithKeepDone(*keepDone))
 	if err != nil {
 		return err
 	}
 	defer q.Close()
 
 	log := newLogger(stderr, slog.LevelInfo)
+	opts := server.Options{Token: token, MaxBodyBytes: *maxBody, Logger: log, Stop: ctx.Done()}
+	if token == "" && isLoopback(host) {
+		// Without a token, answer only requests addressed to this machine,
+		// so a web page can't reach the server through a DNS name that
+		// points here.
+		opts.Hosts = []string{"localhost", "127.0.0.1", "::1"}
+	}
 	srv := &http.Server{
-		Handler:           server.New(q, server.Options{Token: token, MaxBodyBytes: *maxBody, Logger: log}),
+		Handler:           server.New(q, opts),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      45 * time.Second, // longer than the longest claim wait

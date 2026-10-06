@@ -25,9 +25,10 @@ other programs should do the same.
 ## The file
 
 - **SQLite 3.** Any page size and encoding.
-- **WAL journal mode.** ukue switches a new file to WAL, and SQLite records
-  that in the file, so every program that opens it uses WAL too. WAL lets
-  programs read while another one writes.
+- **WAL journal mode.** When ukue adds its tables to a file, it switches the
+  file to WAL, and SQLite records that in the file, so every program that
+  opens it uses WAL too. WAL lets programs read while another one writes.
+  ukue doesn't change the mode again after that.
 - **The header mark.** A file that ukue creates for itself has
   `application_id` set to `0x756B7565` (1969976677), the letters "ukue". The
   tables can also live inside an application's own database, next to its
@@ -63,7 +64,7 @@ CREATE TABLE ukue_jobs (
 	queue        TEXT    NOT NULL CHECK (length(queue) BETWEEN 1 AND 200),
 	payload      BLOB    NOT NULL,
 	state        TEXT    NOT NULL DEFAULT 'ready' CHECK (state IN ('ready', 'running', 'done', 'dead')),
-	priority     INTEGER NOT NULL DEFAULT 0,
+	priority     INTEGER NOT NULL DEFAULT 0 CHECK (priority BETWEEN -100 AND 100),
 	attempts     INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
 	max_attempts INTEGER NOT NULL DEFAULT 10 CHECK (max_attempts >= 1),
 	run_at       INTEGER NOT NULL DEFAULT (CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)),
@@ -81,7 +82,7 @@ CREATE TABLE ukue_jobs (
 | `queue` | The queue's name, 1 to 200 characters. Workers ask for one queue at a time |
 | `payload` | The job's data, as bytes. ukue never reads it. Text is stored as UTF-8 |
 | `state` | `ready`, `running`, `done` or `dead`; see below |
-| `priority` | Among the jobs that are due, the highest priority runs first. Can be negative |
+| `priority` | Among the jobs that are due, the highest priority runs first. From -100 to 100 |
 | `attempts` | How many times the job has been claimed |
 | `max_attempts` | How many attempts the job gets before it is dead |
 | `run_at` | When a ready job may start. In the future, the job is waiting (ukue calls it delayed) |

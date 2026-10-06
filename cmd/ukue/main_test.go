@@ -4,9 +4,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -156,6 +160,7 @@ echo "$UKUE_QUEUE $UKUE_JOB_ID $UKUE_ATTEMPT/$UKUE_MAX_ATTEMPTS $payload" >> "`+
 
 func TestServeNeedsATokenOffThisMachine(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "jobs.ukue")
+	ok(t, "init", file)
 	r := ukueCmd(t, context.Background(), "", "serve", "--addr", "0.0.0.0:0", file)
 	if r.code != 1 || !strings.Contains(r.stderr, "needs a token") {
 		t.Fatalf("%+v", r)
@@ -164,5 +169,160 @@ func TestServeNeedsATokenOffThisMachine(t *testing.T) {
 	defer cancel()
 	if r := ukueCmd(t, ctx, "", "serve", "--addr", "127.0.0.1:0", file); r.code != 0 || !strings.Contains(r.stderr, "ukue serving") {
 		t.Fatalf("serve on localhost: %+v", r)
+	}
+}
+
+func TestFlagErrorsExitTwoAndPrintOnce(t *testing.T) {
+	r := ukueCmd(t, context.Background(), "", "add", "--nope", "f.ukue", "q", "x")
+	if r.code != 2 || strings.Count(r.stderr, "flag provided but not defined") != 1 {
+		t.Fatalf("%+v", r)
+	}
+}
+
+func TestDoubleDashKeepsThePayload(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "jobs.ukue")
+	ok(t, "add", file, "q", "--", "-5")
+	var list struct{ Jobs []map[string]any }
+	json.Unmarshal([]byte(ok(t, "list", "--json", file)), &list)
+	if len(list.Jobs) != 1 || list.Jobs[0]["payload"] != "-5" {
+		t.Fatalf("%+v", list.Jobs)
+	}
+}
+
+func TestOtherSQLiteFilesAreLeftAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE orders (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"stats", path}, {"list", path}, {"work", path, "q", "--", "true"}, {"serve", path}} {
+		r := ukueCmd(t, context.Background(), "", args...)
+		if r.code != 1 || !strings.Contains(r.stderr, "not a ukue file") {
+			t.Fatalf("ukue %s: %+v", args[0], r)
+		}
+	}
+	var mode string
+	var tables int
+	db.QueryRow("PRAGMA journal_mode").Scan(&mode)
+	db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name LIKE 'ukue%'").Scan(&tables)
+	if mode != "delete" || tables != 0 {
+		t.Fatalf("the file was changed: journal mode %s, %d ukue tables", mode, tables)
+	}
+}
+
+func TestWorkChecksItsCommandAndFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "jobs.ukue")
+	if r := ukueCmd(t, context.Background(), "", "work", file, "q", "--", "true"); r.code != 1 || !strings.Contains(r.stderr, "ukue init") {
+		t.Fatalf("missing file: %+v", r)
+	}
+	ok(t, "init", file)
+	if r := ukueCmd(t, context.Background(), "", "work", file, "q", "--", "./no-such-script.sh"); r.code != 2 || !strings.Contains(r.stderr, "can't run") {
+		t.Fatalf("missing command: %+v", r)
+	}
+}
+
+func TestWorkExitZeroIsDoneEvenWithABackgroundChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh")
+	}
+	killDelay = time.Second
+	defer func() { killDelay = 10 * time.Second }()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "jobs.ukue")
+	ok(t, "add", file, "q", "x")
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	// The background sleep keeps the command's output open after it exits.
+	r := ukueCmd(t, ctx, "", "work", "--keep-done", "--poll", "50ms", file, "q", "--", "sh", "-c", "sleep 3 & echo started")
+	var list struct{ Jobs []map[string]any }
+	json.Unmarshal([]byte(ok(t, "list", "--json", file)), &list)
+	if r.code != 0 || len(list.Jobs) != 1 || list.Jobs[0]["state"] != "done" {
+		t.Fatalf("jobs %+v\nlog:\n%s", list.Jobs, r.stderr)
+	}
+}
+
+func TestWorkStopsCommandsWithSIGTERMFirst(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh and signals")
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "jobs.ukue")
+	marker := filepath.Join(dir, "got-term")
+	ok(t, "add", file, "q", "x")
+	script := "trap 'echo yes > " + marker + "; exit 0' TERM; sleep 30 & wait $!"
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan result)
+	go func() {
+		done <- ukueCmd(t, ctx, "", "work", "--grace", "200ms", "--poll", "50ms", file, "q", "--", "sh", "-c", script)
+	}()
+	time.Sleep(time.Second) // let the job start
+	cancel()
+	select {
+	case r := <-done:
+		if r.code != 0 {
+			t.Fatalf("%+v", r)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("work didn't stop")
+	}
+	if b, err := os.ReadFile(marker); err != nil || strings.TrimSpace(string(b)) != "yes" {
+		t.Fatalf("the command didn't get SIGTERM: %v", err)
+	}
+}
+
+func TestServeEndsWaitingClaimsOnShutdown(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "jobs.ukue")
+	ok(t, "init", file)
+	pr, pw := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan int)
+	go func() {
+		served <- run(ctx, []string{"serve", "--addr", "127.0.0.1:0", file}, strings.NewReader(""), io.Discard, pw)
+		pw.Close()
+	}()
+	var url string
+	sc := bufio.NewScanner(pr)
+	for sc.Scan() {
+		if i := strings.Index(sc.Text(), "url=http://"); i >= 0 {
+			url = strings.Fields(sc.Text()[i+4:])[0]
+			break
+		}
+	}
+	go io.Copy(io.Discard, pr)
+	if url == "" {
+		t.Fatal("serve didn't print its address")
+	}
+	// A request addressed to another host name is refused without a token.
+	req, _ := http.NewRequest("GET", url+"/v1/stats", nil)
+	req.Host = "rebind.example"
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("foreign Host: %v %v", resp, err)
+	}
+	claimed := make(chan int)
+	go func() {
+		resp, err := http.Post(url+"/v1/claim", "application/json", strings.NewReader(`{"queue": "q", "wait": 25}`))
+		if err != nil {
+			claimed <- -1
+			return
+		}
+		resp.Body.Close()
+		claimed <- resp.StatusCode
+	}()
+	time.Sleep(300 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	if code := <-claimed; code != http.StatusNoContent {
+		t.Fatalf("the waiting claim got %d", code)
+	}
+	if code := <-served; code != 0 {
+		t.Fatalf("serve exited %d", code)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("shutdown took %s", took)
 	}
 }

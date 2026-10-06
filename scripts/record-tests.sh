@@ -27,8 +27,8 @@ cmd="go test -count=1 -v ./..."
 cmd="go test -race -count=1 ./..."
 { header "Every test with the race detector" "$cmd"; $cmd 2>&1 | grep -v '^time='; } > "$out/race.txt"
 
-cmd="go test -run ^$ -bench . -benchtime 3s ."
-{ header "Benchmarks: every operation is a committed transaction with synchronous = FULL" "$cmd"; $cmd 2>&1; } > "$out/bench.txt"
+cmd="go test -run ^$ -bench . -benchtime 3s -count 3 ."
+{ header "Benchmarks, three runs each: every operation is a committed transaction with synchronous = FULL" "$cmd"; $cmd 2>&1; } > "$out/bench.txt"
 
 grep -E '^(ok|FAIL|---)' "$out/tests.txt" "$out/race.txt" | grep -v -- '--- PASS' || true
 echo "results written to $out/"

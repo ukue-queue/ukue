@@ -137,7 +137,9 @@ covers every endpoint, and
 [examples/python/http_worker.py](examples/python/http_worker.py) is a worker
 in plain Python. To listen beyond your own machine, set a token in
 `UKUE_TOKEN` or `--token-file`; clients then send it as
-`Authorization: Bearer <token>`.
+`Authorization: Bearer <token>`. Without a token, the server answers only
+requests addressed to `localhost`, `127.0.0.1` or `::1`, and web pages from
+other sites can't change anything through it.
 
 **Straight into the file.** A program on the same machine can add a job with
 one SQLite `INSERT`, without going through ukue at all:
@@ -162,7 +164,8 @@ server.
 | dead | ready | Someone retries it |
 
 Among the jobs that are due, workers take the highest priority first, then
-the one that has waited longest.
+the one that has waited longest. Priorities run from -100 to 100, and the
+default is 0.
 
 | Setting | Default | Change it with |
 |---|---|---|
@@ -182,7 +185,7 @@ about an hour and a half before it is dead.
 | `ukue init FILE` | Creates an empty ukue file |
 | `ukue add FILE QUEUE [PAYLOAD]` | Adds a job. The payload comes from standard input when left out. `--delay`, `--at`, `--attempts`, `--priority` |
 | `ukue work FILE QUEUE -- COMMAND` | Runs COMMAND for each job. `--concurrency`, `--timeout`, `--lease`, `--poll`, `--grace`, `--keep-done`, `--quiet` |
-| `ukue serve FILE` | Serves the HTTP API. `--addr`, `--token-file`, `--max-body`, `--keep-done` |
+| `ukue serve FILE` | Serves the HTTP API. `--addr`, `--token-file`, `--allow-no-token`, `--max-body`, `--keep-done` |
 | `ukue stats FILE` | Counts jobs per queue and state, and how long the oldest due job has waited |
 | `ukue list FILE` | Lists jobs. `--queue`, `--state`, `--limit`, `--after`, `--json` |
 | `ukue show FILE ID` | Shows one job with its payload and last error |
@@ -191,8 +194,14 @@ about an hour and a half before it is dead.
 | `ukue delete FILE ID...` | Deletes jobs |
 | `ukue version` | Prints the version |
 
-Options can go before or after the file name. Commands that only look at or
-change existing jobs won't create a file, so a typo in the path is caught.
+Options can go before or after the file name. Only `init` and `add` create a
+file. Every other command needs an existing ukue file and refuses anything
+else, so a typo in the path is caught and other SQLite files are left alone.
+
+When `ukue work` stops, on Ctrl-C, SIGTERM, a `--timeout` or a lost lease, it
+sends SIGTERM to the command and everything the command started, and SIGKILL
+10 seconds later if they're still running. On Ctrl-C it first gives running
+commands the `--grace` period to finish.
 
 ## What ukue promises, and what it doesn't
 
@@ -202,15 +211,16 @@ change existing jobs won't create a file, so a typo in the path is caught.
   idempotency key where a repeat would hurt.
 - **Durable.** ukue runs SQLite with `synchronous = FULL`, so a job that was
   added is still there after a crash or a power cut, as long as the disk
-  really writes what it is told to flush.
+  really writes what it is told to flush. `EnqueueTx` commits on your own
+  connection, so set `synchronous = FULL` there too.
 - **One machine per file.** Many processes on one machine can share the file.
   Programs on other machines go through `ukue serve`. Don't put the file on a
   network file system: SQLite's locking doesn't work there.
 - **Small, and fast enough for small teams.** Each change is a transaction
   flushed to disk, so speed depends mostly on the disk. On a two-core cloud
-  machine, ukue added about 3,600 jobs a second, and a worker ran about 1,000
-  jobs a second. A queue that needs tens of thousands of jobs a second across
-  many machines wants a different tool.
+  machine, ukue added about 4,000 jobs a second, and a worker ran about 900
+  jobs a second (the middle of three runs). A queue that needs tens of
+  thousands of jobs a second across many machines wants a different tool.
 
 ## How it was tested
 
@@ -220,7 +230,7 @@ some harder cases. These results are recorded in [test/results](test/results):
 - **Killed workers.** Four worker processes shared one file while one of them
   was killed with SIGKILL at a random moment, 250 times. All 8,000 jobs
   finished. None was lost or left stuck, and SQLite's integrity check passed
-  during and after the run. 387 jobs ran more than once, as at-least-once
+  during and after the run. 329 jobs ran more than once, as at-least-once
   delivery allows, because their worker was killed between starting the work
   and marking it done.
 - **A worker killed while holding a job,** 20 times in a row. Each job went
@@ -228,11 +238,14 @@ some harder cases. These results are recorded in [test/results](test/results):
   attempt.
 - **Processes sharing a file.** Four processes with four workers each ran
   2,000 jobs, and every job ran exactly once.
+- **A locked file.** Another program held the write lock longer than the busy
+  timeout just as a job finished. The worker kept renewing the lease and
+  trying to mark the job done until it could, and the job ran once.
 - **Python and Go at once.** Python, using its own copy of SQLite, added 200
   jobs while Go workers took them. Every job ran once and the file stayed
   intact. The Python HTTP worker was tested against the server too.
 - **Many jobs waiting.** With 100,000 jobs scheduled for later, an empty claim
-  took 42 microseconds, and adding, claiming and finishing a job took 1.6
+  took 21 microseconds, and adding, claiming and finishing a job took 1.1
   milliseconds. Claims look jobs up through indexes, so a long schedule
   doesn't slow them down.
 - **The race detector** found nothing across the whole suite.
