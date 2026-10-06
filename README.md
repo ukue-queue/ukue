@@ -2,7 +2,7 @@
 
 **µkue, a micro queue: a job queue that lives in one file.**
 
-ukue keeps background jobs in a single SQLite file. Your program adds jobs to
+[ukue](https://ukue.com) keeps background jobs in a single SQLite file. Your program adds jobs to
 it. Workers take them, run them and mark them done. A job that fails is tried
 again after a growing delay. A job can wait for a set time before it runs. A
 job that keeps failing is set aside as a dead letter for a person to look at.
