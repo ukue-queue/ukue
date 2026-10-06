@@ -1,0 +1,11 @@
+ukue
+Copyright ukue.com 2026
+
+This product includes software developed at ukue.com (https://ukue.com).
+
+The ukue command and its ready-built binaries also contain:
+  go-sqlite3, Copyright (c) 2014 Yasuhiro Matsumoto, MIT License
+  SQLite, in the public domain
+  The Go runtime and standard library, Copyright 2009 The Go Authors,
+  BSD-style license
+Their notices are in THIRD_PARTY_LICENSES.md.

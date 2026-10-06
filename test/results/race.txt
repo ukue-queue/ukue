@@ -1,0 +1,9 @@
+# Every test with the race detector
+# recorded 2026-10-06 11:12 UTC with go1.27.1 linux/amd64
+# Linux 6.18.44-fc-v70, Intel(R) Xeon(R) Processor @ 2.10GHz, 2 CPUs
+# command: go test -race -count=1 ./...
+
+ok  	github.com/ukue-queue/ukue	70.121s
+ok  	github.com/ukue-queue/ukue/cmd/ukue	15.377s
+?   	github.com/ukue-queue/ukue/examples/go	[no test files]
+ok  	github.com/ukue-queue/ukue/server	2.489s

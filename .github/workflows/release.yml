@@ -1,0 +1,157 @@
+name: release
+
+# Builds the ukue binaries when a version tag such as v0.1.0 is pushed, checks
+# each one, and attaches them to a GitHub release.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build a static binary
+        env:
+          CC: musl-gcc
+          CGO_ENABLED: "1"
+        run: >
+          go build -trimpath -tags 'sqlite_omit_load_extension netgo osusergo'
+          -ldflags '-s -w -linkmode external -extldflags "-static"' -o ukue ./cmd/ukue
+      - run: file ukue && sh scripts/smoke.sh ./ukue
+      - name: Package
+        run: |
+          mkdir pkg && cp ukue LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md pkg/
+          tar -czf ukue_linux_${{ matrix.arch }}.tar.gz -C pkg .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ukue_linux_${{ matrix.arch }}
+          path: ukue_linux_${{ matrix.arch }}.tar.gz
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            clang: arm64
+          - arch: amd64
+            clang: x86_64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOARCH: ${{ matrix.arch }}
+          CC: clang -arch ${{ matrix.clang }}
+        run: go build -trimpath -tags sqlite_omit_load_extension -ldflags '-s -w' -o ukue ./cmd/ukue
+      - run: file ukue
+      - if: matrix.arch == 'arm64'
+        run: sh scripts/smoke.sh ./ukue
+      - name: Package
+        run: |
+          mkdir pkg && cp ukue LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md pkg/
+          tar -czf ukue_darwin_${{ matrix.arch }}.tar.gz -C pkg .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ukue_darwin_${{ matrix.arch }}
+          path: ukue_darwin_${{ matrix.arch }}.tar.gz
+
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 zip
+      - name: Build
+        env:
+          CC: x86_64-w64-mingw32-gcc
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -trimpath -tags sqlite_omit_load_extension -ldflags '-s -w' -o ukue.exe ./cmd/ukue
+      - name: Package
+        run: |
+          file ukue.exe
+          mkdir pkg && cp ukue.exe LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md pkg/
+          (cd pkg && zip -q ../ukue_windows_amd64.zip *)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ukue_windows_amd64
+          path: ukue_windows_amd64.zip
+
+  windows-check:
+    needs: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ukue_windows_amd64
+      - name: Run the Windows binary
+        shell: pwsh
+        run: |
+          Expand-Archive ukue_windows_amd64.zip -DestinationPath bin
+          $ukue = Resolve-Path bin\ukue.exe
+          & $ukue version
+          & $ukue init check.ukue
+          & $ukue add check.ukue smoke hello
+          & $ukue add check.ukue smoke world
+          $worker = Start-Process -FilePath $ukue -ArgumentList 'work','--quiet','--poll','50ms','check.ukue','smoke','--','findstr','/r','.' -PassThru -NoNewWindow
+          Start-Sleep -Seconds 4
+          Stop-Process -Id $worker.Id
+          $stats = & $ukue stats --json check.ukue | ConvertFrom-Json
+          if (@($stats.queues).Count -ne 0) { & $ukue list check.ukue; throw "jobs were left over" }
+          Write-Output "windows check passed"
+
+  release:
+    needs: [linux, macos, windows, windows-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          cat > notes.md <<EOF
+          Ready-built ukue binaries. Each archive holds the \`ukue\` command with its license files.
+
+          | System | File |
+          |---|---|
+          | Linux, x86-64 (static) | ukue_linux_amd64.tar.gz |
+          | Linux, ARM64 (static) | ukue_linux_arm64.tar.gz |
+          | macOS, Apple silicon | ukue_darwin_arm64.tar.gz |
+          | macOS, Intel | ukue_darwin_amd64.tar.gz |
+          | Windows, x86-64 | ukue_windows_amd64.zip |
+
+          SHA256SUMS lists the checksums. The macOS binaries aren't signed by Apple, so macOS may ask you to allow them the first time (or run \`xattr -d com.apple.quarantine ukue\`).
+          EOF
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "ukue $GITHUB_REF_NAME" --notes-file notes.md \
+            ukue_linux_amd64.tar.gz ukue_linux_arm64.tar.gz ukue_darwin_arm64.tar.gz ukue_darwin_amd64.tar.gz ukue_windows_amd64.zip SHA256SUMS
