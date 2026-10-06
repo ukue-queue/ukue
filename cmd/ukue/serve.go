@@ -61,7 +61,7 @@ func cmdServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	defer q.Close()
 
-	log := slog.New(slog.NewTextHandler(stderr, nil))
+	log := newLogger(stderr, slog.LevelInfo)
 	srv := &http.Server{
 		Handler:           server.New(q, server.Options{Token: token, MaxBodyBytes: *maxBody, Logger: log}),
 		ReadHeaderTimeout: 10 * time.Second,

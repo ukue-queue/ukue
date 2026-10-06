@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -511,6 +512,20 @@ func infoMap(j *ukue.JobInfo) map[string]any {
 		m["payload_base64"] = j.Payload // encoded as base64 by encoding/json
 	}
 	return m
+}
+
+// newLogger writes log lines with the time of day only, which keeps them
+// short enough to read in a terminal.
+func newLogger(w io.Writer, level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{
+		Level: level,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey && len(groups) == 0 {
+				return slog.String(slog.TimeKey, a.Value.Time().Format("15:04:05"))
+			}
+			return a
+		},
+	}))
 }
 
 func printJSON(w io.Writer, v any) error {

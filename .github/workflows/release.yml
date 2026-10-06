@@ -21,8 +21,8 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
@@ -38,7 +38,7 @@ jobs:
         run: |
           mkdir pkg && cp ukue LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md pkg/
           tar -czf ukue_linux_${{ matrix.arch }}.tar.gz -C pkg .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ukue_linux_${{ matrix.arch }}
           path: ukue_linux_${{ matrix.arch }}.tar.gz
@@ -53,8 +53,8 @@ jobs:
             clang: x86_64
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
       - name: Build
@@ -70,7 +70,7 @@ jobs:
         run: |
           mkdir pkg && cp ukue LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md pkg/
           tar -czf ukue_darwin_${{ matrix.arch }}.tar.gz -C pkg .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ukue_darwin_${{ matrix.arch }}
           path: ukue_darwin_${{ matrix.arch }}.tar.gz
@@ -78,8 +78,8 @@ jobs:
   windows:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 zip
@@ -95,7 +95,7 @@ jobs:
           file ukue.exe
           mkdir pkg && cp ukue.exe LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md pkg/
           (cd pkg && zip -q ../ukue_windows_amd64.zip *)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ukue_windows_amd64
           path: ukue_windows_amd64.zip
@@ -104,7 +104,7 @@ jobs:
     needs: windows
     runs-on: windows-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ukue_windows_amd64
       - name: Run the Windows binary
@@ -129,7 +129,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

@@ -64,7 +64,7 @@ func cmdWork(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	var mu sync.Mutex
 	out := &lockedWriter{w: stdout, mu: &mu}
 	errOut := &lockedWriter{w: stderr, mu: &mu}
-	log := slog.New(slog.NewTextHandler(errOut, &slog.HandlerOptions{Level: level}))
+	log := newLogger(errOut, level)
 	log.Info("ukue worker started", "file", file, "queue", queue, "command", strings.Join(command, " "), "concurrency", *concurrency)
 
 	h := func(jctx context.Context, job *ukue.Job) error {
