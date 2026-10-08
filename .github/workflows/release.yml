@@ -1,10 +1,21 @@
 name: release
 
-# Builds the ukue binaries when a GitHub release is published, checks each
-# one, and attaches them to the release. It can also be run by hand for an
-# existing release tag.
+# Builds the ukue binaries, checks each one, and publishes them with a
+# release.
+#
+# Releases go out on their own. When the tests pass on a push to main and the
+# version in ukue.go has no tag yet, this workflow builds and checks the
+# binaries from that commit, then tags it and publishes the release with the
+# binaries attached. Nothing goes public unless every build and check passes.
+#
+# It also attaches binaries to a release someone publishes by hand, and it
+# can be run by hand to rebuild the binaries of an existing tag.
 
 on:
+  workflow_run:
+    workflows: [test]
+    types: [completed]
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -16,11 +27,68 @@ on:
 permissions:
   contents: read
 
-env:
-  TAG: ${{ github.event.release.tag_name || inputs.tag }}
-
 jobs:
+  plan:
+    # After the tests, only for a push to main in this repository that passed.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      ref: ${{ steps.plan.outputs.ref }}
+      new: ${{ steps.plan.outputs.new }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          case "$EVENT" in
+          workflow_run)
+            # Only the commit main is at now; if main has moved on, the run
+            # after the next push decides.
+            head=$(git ls-remote origin refs/heads/main | cut -f1)
+            if [ "$head" != "$RUN_SHA" ]; then
+              echo "No release: main has moved on from $RUN_SHA to $head."
+              exit 0
+            fi
+            version=$(sed -n 's/^const Version = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' ukue.go)
+            if [ -z "$version" ]; then
+              echo "ukue.go has no Version of the form X.Y.Z" >&2
+              exit 1
+            fi
+            tags=$(git ls-remote --tags --refs origin) || { echo "Couldn't read the repository's tags" >&2; exit 1; }
+            if grep -q "refs/tags/v$version\$" <<< "$tags"; then
+              echo "No release: v$version is out already."
+              exit 0
+            fi
+            newest=$({ grep -o 'refs/tags/v[0-9]*\.[0-9]*\.[0-9]*$' <<< "$tags" || true; } | sed 's|refs/tags/v||' | sort -V | tail -n 1)
+            if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$version" | sort -V | tail -n 1)" != "$version" ]; then
+              echo "v$version is older than the newest release, v$newest; raise the version above it" >&2
+              exit 1
+            fi
+            echo "Releasing v$version from $RUN_SHA."
+            { echo "tag=v$version"; echo "ref=$RUN_SHA"; echo "new=true"; } >> "$GITHUB_OUTPUT"
+            ;;
+          release)
+            { echo "tag=$RELEASE_TAG"; echo "ref=$RELEASE_TAG"; } >> "$GITHUB_OUTPUT"
+            ;;
+          workflow_dispatch)
+            { echo "tag=$INPUT_TAG"; echo "ref=$INPUT_TAG"; } >> "$GITHUB_OUTPUT"
+            ;;
+          esac
+
   linux:
+    needs: plan
+    if: needs.plan.outputs.tag != ''
     strategy:
       matrix:
         include:
@@ -32,7 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.plan.outputs.ref }}
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
@@ -55,6 +123,8 @@ jobs:
           path: ukue_linux_${{ matrix.arch }}.tar.gz
 
   macos:
+    needs: plan
+    if: needs.plan.outputs.tag != ''
     strategy:
       matrix:
         include:
@@ -66,7 +136,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.plan.outputs.ref }}
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
@@ -89,11 +159,13 @@ jobs:
           path: ukue_darwin_${{ matrix.arch }}.tar.gz
 
   windows:
+    needs: plan
+    if: needs.plan.outputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.plan.outputs.ref }}
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27.x"
@@ -125,6 +197,7 @@ jobs:
       - name: Run the Windows binary
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           Expand-Archive ukue_windows_amd64.zip -DestinationPath bin
           $ukue = Resolve-Path bin\ukue.exe
           & $ukue version
@@ -139,31 +212,30 @@ jobs:
           Write-Output "windows check passed"
 
   release:
-    needs: [linux, macos, windows, windows-check]
+    needs: [plan, linux, macos, windows, windows-check]
+    # Two runs for the same tag take turns; the second finds it published.
+    concurrency:
+      group: release-${{ needs.plan.outputs.tag }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      REF: ${{ needs.plan.outputs.ref }}
+      NEW: ${{ needs.plan.outputs.new }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - name: Attach the binaries to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Checksums and notes
         run: |
           cd dist
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            ukue_linux_amd64.tar.gz ukue_linux_arm64.tar.gz ukue_darwin_arm64.tar.gz ukue_darwin_amd64.tar.gz ukue_windows_amd64.zip SHA256SUMS
-      - name: Describe the binaries if the release has no notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          body=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
-          if [ -n "$body" ]; then exit 0; fi
-          cat > notes.md <<'EOF'
+          cat > ../notes.md <<'EOF'
           Ready-built ukue binaries. Each archive holds the `ukue` command with its license files.
 
           | System | File |
@@ -176,4 +248,24 @@ jobs:
 
           SHA256SUMS lists the checksums. The macOS binaries aren't signed by Apple, so macOS may ask you to allow them the first time, or you can run `xattr -d com.apple.quarantine ukue`.
           EOF
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+      - name: Tag the commit and publish the release, binaries attached
+        if: env.NEW == 'true'
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$TAG is out already."
+            exit 0
+          fi
+          cd dist
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$REF" \
+            --title "ukue $TAG" --notes-file ../notes.md \
+            ukue_linux_amd64.tar.gz ukue_linux_arm64.tar.gz ukue_darwin_arm64.tar.gz ukue_darwin_amd64.tar.gz ukue_windows_amd64.zip SHA256SUMS
+      - name: Attach the binaries to an existing release
+        if: env.NEW != 'true'
+        run: |
+          cd dist
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            ukue_linux_amd64.tar.gz ukue_linux_arm64.tar.gz ukue_darwin_arm64.tar.gz ukue_darwin_amd64.tar.gz ukue_windows_amd64.zip SHA256SUMS
+          body=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          if [ -z "$body" ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file ../notes.md
+          fi
